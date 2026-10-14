@@ -3,7 +3,7 @@ name: ProjetoBR
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */8 * * *"
+    - cron: "17 */8 * * *" # every 8 hours (UTC)
 
 permissions:
   contents: write
@@ -19,6 +19,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Install ImageMagick
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
 
       - name: Build self-contained ProjetoBR archive
         env:
@@ -39,6 +45,7 @@ jobs:
             "$TMP/css" \
             "$TMP/dist" \
             "$TMP/data" \
+            "$TMP/source-images" \
             "$TMP/images" \
             "$TMP/markers" \
             "$TMP/vendor/leaflet/images" \
@@ -82,11 +89,41 @@ jobs:
             fi
           }
 
+          # Support both ImageMagick 6 and 7.
+          im_montage() {
+            if command -v magick >/dev/null 2>&1; then
+              magick montage "$@"
+            else
+              montage "$@"
+            fi
+          }
+
+          im_convert() {
+            if command -v magick >/dev/null 2>&1; then
+              magick "$@"
+            else
+              convert "$@"
+            fi
+          }
+
+          im_identify() {
+            if command -v magick >/dev/null 2>&1; then
+              magick identify "$@"
+            else
+              identify "$@"
+            fi
+          }
+
           echo "=========================================="
           echo " ProjetoBR self-contained archival mirror"
           echo " Source: $SOURCE_URL"
           echo " Destination: $OUT"
+          echo " Output map tiles: 1024x1024"
           echo "=========================================="
+
+          # ------------------------------------------------------------
+          # Main ProjetoBR files
+          # ------------------------------------------------------------
 
           fetch_site "" "$TMP/index.html"
 
@@ -107,12 +144,17 @@ jobs:
             "dist/Leaflet.Coordinates-0.1.5.min.js" \
             "$TMP/dist/Leaflet.Coordinates-0.1.5.min.js"
 
+          # ------------------------------------------------------------
+          # Runtime data
+          # ------------------------------------------------------------
+
           fetch_site "data/config.json"      "$TMP/data/config.json"
           fetch_site "data/villages.json"    "$TMP/data/villages.json"
           fetch_site "data/guardtowers.json" "$TMP/data/guardtowers.json"
           fetch_site "data/structures.json"  "$TMP/data/structures.json"
           fetch_site "data/portals.json"     "$TMP/data/portals.json"
 
+          # Optional realtime player snapshot.
           if curl \
               --fail \
               --silent \
@@ -133,6 +175,10 @@ jobs:
             rm -f "$TMP/data/players.php"
           fi
 
+          # ------------------------------------------------------------
+          # Marker images
+          # ------------------------------------------------------------
+
           grep -oE "markers/[A-Za-z0-9_.-]+\.png" \
             "$TMP/app/markers.js" \
             | sort -u \
@@ -146,31 +192,178 @@ jobs:
           rm -f "$TMP/marker-list.txt"
 
           # ------------------------------------------------------------
-          # ProjetoBR map dimensions
+          # Download original 256x256 source map tiles.
+          #
+          # ProjetoBR is a 4096x4096 map:
+          #   4096 / 256 = 16 source tiles per axis
+          #   16 x 16 = 256 source tile requests during the Actions job
+          #
+          # These source tiles are NOT published to GitHub Pages.
           # ------------------------------------------------------------
-          # grid.js confirms the world is 4096 x 4096.
-          # WurmMapGen uses 256px source tiles.
-          # ------------------------------------------------------------
 
-          MAP_SIZE=4096
-          TILE_SIZE=256
+          SOURCE_TILE_SIZE=256
+          SOURCE_TILES_PER_AXIS=16
+          SOURCE_TILE_COUNT=256
 
-          TILES_PER_AXIS="$((MAP_SIZE / TILE_SIZE))"
-          MAX_TILE="$((TILES_PER_AXIS - 1))"
-          EXPECTED_TILE_COUNT="$((TILES_PER_AXIS * TILES_PER_AXIS))"
+          echo
+          echo "Downloading $SOURCE_TILE_COUNT original 256x256 tiles..."
 
-          echo "Map size: $MAP_SIZE"
-          echo "Tile size: $TILE_SIZE"
-          echo "Tiles per axis: $TILES_PER_AXIS"
-          echo "Expected tiles: $EXPECTED_TILE_COUNT"
-
-          for x in $(seq 0 "$MAX_TILE"); do
-            for y in $(seq 0 "$MAX_TILE"); do
+          for x in $(seq 0 15); do
+            for y in $(seq 0 15); do
               fetch_site \
                 "images/${x}-${y}.png" \
+                "$TMP/source-images/${x}-${y}.png"
+            done
+          done
+
+          ACTUAL_SOURCE_COUNT="$(
+            find "$TMP/source-images" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.png' \
+              | wc -l
+          )"
+
+          if [ "$ACTUAL_SOURCE_COUNT" -ne "$SOURCE_TILE_COUNT" ]; then
+            echo "ERROR: Expected $SOURCE_TILE_COUNT source tiles."
+            echo "Found: $ACTUAL_SOURCE_COUNT"
+            exit 1
+          fi
+
+          # ------------------------------------------------------------
+          # Build a row-major tile list for ImageMagick.
+          #
+          # Source filenames use X-Y:
+          #   0-0, 1-0, ... 15-0
+          #   0-1, 1-1, ... 15-1
+          #   ...
+          #
+          # This preserves the map's original orientation.
+          # ------------------------------------------------------------
+
+          TILE_LIST="$TMP/source-tile-list.txt"
+          : > "$TILE_LIST"
+
+          for y in $(seq 0 15); do
+            for x in $(seq 0 15); do
+              printf '%s\n' "$TMP/source-images/${x}-${y}.png" >> "$TILE_LIST"
+            done
+          done
+
+          # ------------------------------------------------------------
+          # Merge the 256 source tiles into one exact 4096x4096 image.
+          # ------------------------------------------------------------
+
+          FULL_MAP="$TMP/projetobr-full-4096.png"
+
+          echo
+          echo "Merging source tiles into one 4096x4096 image..."
+
+          im_montage \
+            @"$TILE_LIST" \
+            -tile 16x16 \
+            -geometry 256x256+0+0 \
+            -background none \
+            "$FULL_MAP"
+
+          FULL_SIZE="$(im_identify -format '%wx%h' "$FULL_MAP")"
+
+          echo "Merged map dimensions: $FULL_SIZE"
+
+          if [ "$FULL_SIZE" != "4096x4096" ]; then
+            echo "ERROR: Expected merged image to be 4096x4096."
+            exit 1
+          fi
+
+          # ------------------------------------------------------------
+          # Split the merged map into 1024x1024 Leaflet tiles.
+          #
+          # 4096 / 1024 = 4 per axis
+          # 4 x 4 = 16 browser map tile requests maximum at native zoom.
+          # ------------------------------------------------------------
+
+          OUTPUT_TILE_SIZE=1024
+          OUTPUT_TILES_PER_AXIS=4
+          OUTPUT_TILE_COUNT=16
+
+          echo
+          echo "Splitting merged image into $OUTPUT_TILE_COUNT 1024x1024 tiles..."
+
+          for y in $(seq 0 3); do
+            for x in $(seq 0 3); do
+              X_OFFSET="$((x * OUTPUT_TILE_SIZE))"
+              Y_OFFSET="$((y * OUTPUT_TILE_SIZE))"
+
+              im_convert \
+                "$FULL_MAP" \
+                -crop "${OUTPUT_TILE_SIZE}x${OUTPUT_TILE_SIZE}+${X_OFFSET}+${Y_OFFSET}" \
+                +repage \
                 "$TMP/images/${x}-${y}.png"
             done
           done
+
+          ACTUAL_OUTPUT_COUNT="$(
+            find "$TMP/images" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.png' \
+              | wc -l
+          )"
+
+          if [ "$ACTUAL_OUTPUT_COUNT" -ne "$OUTPUT_TILE_COUNT" ]; then
+            echo "ERROR: Expected $OUTPUT_TILE_COUNT output tiles."
+            echo "Found: $ACTUAL_OUTPUT_COUNT"
+            exit 1
+          fi
+
+          for tile in "$TMP"/images/*.png; do
+            SIZE="$(im_identify -format '%wx%h' "$tile")"
+            if [ "$SIZE" != "1024x1024" ]; then
+              echo "ERROR: Invalid output tile dimensions:"
+              echo "  $tile = $SIZE"
+              exit 1
+            fi
+          done
+
+          # ------------------------------------------------------------
+          # IMPORTANT:
+          #
+          # Leave data/config.json unchanged.
+          #
+          # WurmMapGen main.js uses config.mapTileSize when calculating
+          # xyMulitiplier for game-coordinate -> Leaflet-coordinate
+          # conversion. Changing config.mapTileSize would move deeds,
+          # towers, structures and the custom balance grid.
+          #
+          # Only change the Leaflet TileLayer's physical tileSize.
+          # ------------------------------------------------------------
+
+          python3 - "$TMP/app/map.js" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+
+          old = "tileSize: config.mapTileSize,"
+          new = "tileSize: 1024,"
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: Could not find expected tileSize setting in app/map.js"
+              )
+
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+
+          print("Patched app/map.js: Leaflet tileSize = 1024")
+          PY
+
+          grep -q 'tileSize: 1024,' "$TMP/app/map.js"
+
+          # ------------------------------------------------------------
+          # Vendor Leaflet and its images
+          # ------------------------------------------------------------
 
           fetch_url \
             "https://unpkg.com/leaflet@1.2.0/dist/leaflet.css" \
@@ -192,6 +385,10 @@ jobs:
             "https://unpkg.com/leaflet@1.2.0/dist/images/marker-shadow.png" \
             "$TMP/vendor/leaflet/images/marker-shadow.png"
 
+          # ------------------------------------------------------------
+          # Vendor JS dependencies
+          # ------------------------------------------------------------
+
           fetch_url \
             "https://unpkg.com/cookies-js@1.2.3/dist/cookies.min.js" \
             "$TMP/vendor/cookies.min.js"
@@ -207,6 +404,10 @@ jobs:
           fetch_url \
             "https://unpkg.com/vue@2.5.9/dist/vue.min.js" \
             "$TMP/vendor/vue.min.js"
+
+          # ------------------------------------------------------------
+          # Vendor Roboto font
+          # ------------------------------------------------------------
 
           curl \
             --fail \
@@ -282,6 +483,10 @@ jobs:
           source.unlink()
           PY
 
+          # ------------------------------------------------------------
+          # Rewrite index.html to local vendor resources
+          # ------------------------------------------------------------
+
           python3 - "$TMP/index.html" <<'PY'
           import re
           import sys
@@ -334,6 +539,10 @@ jobs:
           path.write_text(html, encoding="utf-8")
           PY
 
+          # ------------------------------------------------------------
+          # Validate archive
+          # ------------------------------------------------------------
+
           REQUIRED_FILES=(
             "index.html"
             "app/util.js"
@@ -350,6 +559,8 @@ jobs:
             "data/guardtowers.json"
             "data/structures.json"
             "data/portals.json"
+            "images/0-0.png"
+            "images/3-3.png"
             "vendor/leaflet/leaflet.css"
             "vendor/leaflet/leaflet.js"
             "vendor/leaflet/images/marker-icon.png"
@@ -369,7 +580,7 @@ jobs:
             fi
           done
 
-          TILE_COUNT="$(
+          FINAL_TILE_COUNT="$(
             find "$TMP/images" \
               -maxdepth 1 \
               -type f \
@@ -377,9 +588,9 @@ jobs:
               | wc -l
           )"
 
-          if [ "$TILE_COUNT" -ne "$EXPECTED_TILE_COUNT" ]; then
-            echo "ERROR: Expected $EXPECTED_TILE_COUNT tiles."
-            echo "Found: $TILE_COUNT"
+          if [ "$FINAL_TILE_COUNT" -ne 16 ]; then
+            echo "ERROR: Expected exactly 16 published map tiles."
+            echo "Found: $FINAL_TILE_COUNT"
             exit 1
           fi
 
@@ -394,6 +605,7 @@ jobs:
             exit 1
           fi
 
+          grep -q 'tileSize: 1024,' "$TMP/app/map.js"
           grep -q 'vendor/leaflet/leaflet.css' "$TMP/index.html"
           grep -q 'vendor/leaflet/leaflet.js' "$TMP/index.html"
           grep -q 'vendor/roboto/roboto.css' "$TMP/index.html"
@@ -404,9 +616,19 @@ jobs:
 
           echo
           echo "Validation successful."
-          echo "Map tiles: $TILE_COUNT"
+          echo "Published map tiles: $FINAL_TILE_COUNT"
+          echo "Published tile size: 1024x1024"
           echo "Fonts: $FONT_COUNT"
           du -sh "$TMP"
+
+          # Remove intermediate source material before publishing.
+          rm -rf "$TMP/source-images"
+          rm -f "$TMP/source-tile-list.txt"
+          rm -f "$TMP/projetobr-full-4096.png"
+
+          # ------------------------------------------------------------
+          # Replace repository snapshot only after validation succeeds
+          # ------------------------------------------------------------
 
           mkdir -p "$OUT"
 
