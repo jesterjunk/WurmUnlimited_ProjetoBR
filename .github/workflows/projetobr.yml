@@ -90,14 +90,6 @@ jobs:
           }
 
           # Support both ImageMagick 6 and 7.
-          im_montage() {
-            if command -v magick >/dev/null 2>&1; then
-              magick montage "$@"
-            else
-              montage "$@"
-            fi
-          }
-
           im_convert() {
             if command -v magick >/dev/null 2>&1; then
               magick "$@"
@@ -231,39 +223,75 @@ jobs:
           fi
 
           # ------------------------------------------------------------
-          # Build a row-major tile list for ImageMagick.
+          # Merge the 256 source tiles without using ImageMagick @file.
           #
-          # Source filenames use X-Y:
-          #   0-0, 1-0, ... 15-0
-          #   0-1, 1-1, ... 15-1
-          #   ...
+          # Ubuntu's ImageMagick 6 security policy commonly blocks
+          # indirect filename reads such as:
           #
-          # This preserves the map's original orientation.
+          #     montage @tile-list.txt
+          #
+          # Build each 4096x256 row explicitly with +append, then join
+          # the 16 rows vertically with -append. This preserves the
+          # original X-Y tile orientation and avoids the policy issue.
           # ------------------------------------------------------------
 
-          TILE_LIST="$TMP/source-tile-list.txt"
-          : > "$TILE_LIST"
+          mkdir -p "$TMP/rows"
+
+          echo
+          echo "Building 16 horizontal map rows..."
 
           for y in $(seq 0 15); do
-            for x in $(seq 0 15); do
-              printf '%s\n' "$TMP/source-images/${x}-${y}.png" >> "$TILE_LIST"
-            done
-          done
+            im_convert \
+              "$TMP/source-images/0-${y}.png" \
+              "$TMP/source-images/1-${y}.png" \
+              "$TMP/source-images/2-${y}.png" \
+              "$TMP/source-images/3-${y}.png" \
+              "$TMP/source-images/4-${y}.png" \
+              "$TMP/source-images/5-${y}.png" \
+              "$TMP/source-images/6-${y}.png" \
+              "$TMP/source-images/7-${y}.png" \
+              "$TMP/source-images/8-${y}.png" \
+              "$TMP/source-images/9-${y}.png" \
+              "$TMP/source-images/10-${y}.png" \
+              "$TMP/source-images/11-${y}.png" \
+              "$TMP/source-images/12-${y}.png" \
+              "$TMP/source-images/13-${y}.png" \
+              "$TMP/source-images/14-${y}.png" \
+              "$TMP/source-images/15-${y}.png" \
+              +append \
+              "$TMP/rows/row-${y}.png"
 
-          # ------------------------------------------------------------
-          # Merge the 256 source tiles into one exact 4096x4096 image.
-          # ------------------------------------------------------------
+            ROW_SIZE="$(im_identify -format '%wx%h' "$TMP/rows/row-${y}.png")"
+
+            if [ "$ROW_SIZE" != "4096x256" ]; then
+              echo "ERROR: Row $y is $ROW_SIZE; expected 4096x256."
+              exit 1
+            fi
+          done
 
           FULL_MAP="$TMP/projetobr-full-4096.png"
 
           echo
-          echo "Merging source tiles into one 4096x4096 image..."
+          echo "Joining rows into one 4096x4096 image..."
 
-          im_montage \
-            @"$TILE_LIST" \
-            -tile 16x16 \
-            -geometry 256x256+0+0 \
-            -background none \
+          im_convert \
+            "$TMP/rows/row-0.png" \
+            "$TMP/rows/row-1.png" \
+            "$TMP/rows/row-2.png" \
+            "$TMP/rows/row-3.png" \
+            "$TMP/rows/row-4.png" \
+            "$TMP/rows/row-5.png" \
+            "$TMP/rows/row-6.png" \
+            "$TMP/rows/row-7.png" \
+            "$TMP/rows/row-8.png" \
+            "$TMP/rows/row-9.png" \
+            "$TMP/rows/row-10.png" \
+            "$TMP/rows/row-11.png" \
+            "$TMP/rows/row-12.png" \
+            "$TMP/rows/row-13.png" \
+            "$TMP/rows/row-14.png" \
+            "$TMP/rows/row-15.png" \
+            -append \
             "$FULL_MAP"
 
           FULL_SIZE="$(im_identify -format '%wx%h' "$FULL_MAP")"
@@ -623,7 +651,7 @@ jobs:
 
           # Remove intermediate source material before publishing.
           rm -rf "$TMP/source-images"
-          rm -f "$TMP/source-tile-list.txt"
+          rm -rf "$TMP/rows"
           rm -f "$TMP/projetobr-full-4096.png"
 
           # ------------------------------------------------------------
