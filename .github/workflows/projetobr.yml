@@ -1,0 +1,458 @@
+name: ProjetoBR
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: projetobr-archival-mirror
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build self-contained ProjetoBR archive
+        env:
+          SOURCE_URL: "http://projetobr.duckdns.org:8081"
+        run: |
+          set -euo pipefail
+
+          OUT="map"
+          TMP="$(mktemp -d)"
+
+          cleanup() {
+            rm -rf "$TMP"
+          }
+          trap cleanup EXIT
+
+          mkdir -p \
+            "$TMP/app" \
+            "$TMP/css" \
+            "$TMP/dist" \
+            "$TMP/data" \
+            "$TMP/images" \
+            "$TMP/markers" \
+            "$TMP/vendor/leaflet/images" \
+            "$TMP/vendor/roboto/fonts"
+
+          fetch_url() {
+            local url="$1"
+            local file="$2"
+
+            echo "Fetching: $url"
+            mkdir -p "$(dirname "$file")"
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --retry-all-errors \
+              --retry-delay 3 \
+              --connect-timeout 20 \
+              --max-time 180 \
+              -H 'Accept-Encoding: identity' \
+              -o "$file" \
+              "$url"
+
+            if [ ! -s "$file" ]; then
+              echo "ERROR: Empty response: $url"
+              exit 1
+            fi
+          }
+
+          fetch_site() {
+            local path="$1"
+            local file="$2"
+
+            if [ -z "$path" ]; then
+              fetch_url "$SOURCE_URL/" "$file"
+            else
+              fetch_url "$SOURCE_URL/$path" "$file"
+            fi
+          }
+
+          echo "=========================================="
+          echo " ProjetoBR self-contained archival mirror"
+          echo " Source: $SOURCE_URL"
+          echo " Destination: $OUT"
+          echo "=========================================="
+
+          fetch_site "" "$TMP/index.html"
+
+          fetch_site "app/util.js"    "$TMP/app/util.js"
+          fetch_site "app/markers.js" "$TMP/app/markers.js"
+          fetch_site "app/map.js"     "$TMP/app/map.js"
+          fetch_site "app/gui.js"     "$TMP/app/gui.js"
+          fetch_site "app/main.js"    "$TMP/app/main.js"
+          fetch_site "app/grid.js"    "$TMP/app/grid.js"
+
+          fetch_site "css/style.css" "$TMP/css/style.css"
+
+          fetch_site \
+            "dist/Leaflet.Coordinates-0.1.5.css" \
+            "$TMP/dist/Leaflet.Coordinates-0.1.5.css"
+
+          fetch_site \
+            "dist/Leaflet.Coordinates-0.1.5.min.js" \
+            "$TMP/dist/Leaflet.Coordinates-0.1.5.min.js"
+
+          fetch_site "data/config.json"      "$TMP/data/config.json"
+          fetch_site "data/villages.json"    "$TMP/data/villages.json"
+          fetch_site "data/guardtowers.json" "$TMP/data/guardtowers.json"
+          fetch_site "data/structures.json"  "$TMP/data/structures.json"
+          fetch_site "data/portals.json"     "$TMP/data/portals.json"
+
+          if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 2 \
+              --connect-timeout 20 \
+              --max-time 60 \
+              -H 'Accept-Encoding: identity' \
+              -o "$TMP/data/players.php" \
+              "$SOURCE_URL/data/players.php"; then
+
+            if [ ! -s "$TMP/data/players.php" ]; then
+              rm -f "$TMP/data/players.php"
+            fi
+          else
+            echo "players.php unavailable; continuing."
+            rm -f "$TMP/data/players.php"
+          fi
+
+          grep -oE "markers/[A-Za-z0-9_.-]+\.png" \
+            "$TMP/app/markers.js" \
+            | sort -u \
+            > "$TMP/marker-list.txt"
+
+          while IFS= read -r marker; do
+            [ -n "$marker" ] || continue
+            fetch_site "$marker" "$TMP/$marker"
+          done < "$TMP/marker-list.txt"
+
+          rm -f "$TMP/marker-list.txt"
+
+          TILES_PER_AXIS="$(
+            python3 - "$TMP/data/config.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8") as f:
+              cfg = json.load(f)
+
+          actual = int(cfg["actualMapSize"])
+          tile = int(cfg["mapTileSize"])
+
+          if actual <= 0 or tile <= 0:
+              raise SystemExit("Invalid map dimensions")
+
+          if actual % tile != 0:
+              raise SystemExit(
+                  f"actualMapSize {actual} is not divisible by mapTileSize {tile}"
+              )
+
+          print(actual // tile)
+          PY
+          )"
+
+          MAX_TILE="$((TILES_PER_AXIS - 1))"
+          EXPECTED_TILE_COUNT="$((TILES_PER_AXIS * TILES_PER_AXIS))"
+
+          echo "Tiles per axis: $TILES_PER_AXIS"
+          echo "Expected tiles: $EXPECTED_TILE_COUNT"
+
+          for x in $(seq 0 "$MAX_TILE"); do
+            for y in $(seq 0 "$MAX_TILE"); do
+              fetch_site \
+                "images/${x}-${y}.png" \
+                "$TMP/images/${x}-${y}.png"
+            done
+          done
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/leaflet.css" \
+            "$TMP/vendor/leaflet/leaflet.css"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/leaflet.js" \
+            "$TMP/vendor/leaflet/leaflet.js"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/images/marker-icon.png" \
+            "$TMP/vendor/leaflet/images/marker-icon.png"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/images/marker-icon-2x.png" \
+            "$TMP/vendor/leaflet/images/marker-icon-2x.png"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/images/marker-shadow.png" \
+            "$TMP/vendor/leaflet/images/marker-shadow.png"
+
+          fetch_url \
+            "https://unpkg.com/cookies-js@1.2.3/dist/cookies.min.js" \
+            "$TMP/vendor/cookies.min.js"
+
+          fetch_url \
+            "https://unpkg.com/whatwg-fetch@2.0.3/fetch.js" \
+            "$TMP/vendor/fetch.js"
+
+          fetch_url \
+            "https://unpkg.com/promise-polyfill@6.1.0/promise.min.js" \
+            "$TMP/vendor/promise.min.js"
+
+          fetch_url \
+            "https://unpkg.com/vue@2.5.9/dist/vue.min.js" \
+            "$TMP/vendor/vue.min.js"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 20 \
+            --max-time 180 \
+            -A "Mozilla/5.0" \
+            -o "$TMP/vendor/roboto/roboto.css.remote" \
+            "https://fonts.googleapis.com/css?family=Roboto:400,700"
+
+          python3 - "$TMP/vendor/roboto/roboto.css.remote" <<'PY'
+          import hashlib
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          source = Path(sys.argv[1])
+          base = source.parent
+          font_dir = base / "fonts"
+          font_dir.mkdir(parents=True, exist_ok=True)
+
+          css = source.read_text(encoding="utf-8")
+          urls = []
+
+          for match in re.finditer(
+              r"url\((['\"]?)(https?://[^)'\"\s]+)\1\)",
+              css
+          ):
+              url = match.group(2)
+              if url not in urls:
+                  urls.append(url)
+
+          for url in urls:
+              parsed = urlparse(url)
+              original_name = os.path.basename(parsed.path) or "font"
+              digest = hashlib.sha256(url.encode()).hexdigest()[:10]
+              filename = f"{digest}-{original_name}"
+              destination = font_dir / filename
+
+              print(f"Fetching font: {url}")
+
+              subprocess.run(
+                  [
+                      "curl",
+                      "--fail",
+                      "--silent",
+                      "--show-error",
+                      "--location",
+                      "--retry", "3",
+                      "--retry-all-errors",
+                      "--connect-timeout", "20",
+                      "--max-time", "180",
+                      "-H", "Accept-Encoding: identity",
+                      "-o", str(destination),
+                      url,
+                  ],
+                  check=True,
+              )
+
+              if not destination.exists() or destination.stat().st_size == 0:
+                  raise SystemExit(f"Downloaded font is empty: {url}")
+
+              css = css.replace(url, f"fonts/{filename}")
+
+          (base / "roboto.css").write_text(css, encoding="utf-8")
+          source.unlink()
+          PY
+
+          python3 - "$TMP/index.html" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          html = path.read_text(encoding="utf-8")
+
+          replacements = {
+              "https://unpkg.com/leaflet@1.2.0/dist/leaflet.css":
+                  "vendor/leaflet/leaflet.css",
+              "https://fonts.googleapis.com/css?family=Roboto:400,700":
+                  "vendor/roboto/roboto.css",
+              "https://unpkg.com/leaflet@1.2.0/dist/leaflet.js":
+                  "vendor/leaflet/leaflet.js",
+              "https://unpkg.com/cookies-js@1.2.3/dist/cookies.min.js":
+                  "vendor/cookies.min.js",
+              "https://unpkg.com/whatwg-fetch@2.0.3/fetch.js":
+                  "vendor/fetch.js",
+              "https://unpkg.com/promise-polyfill@6.1.0/promise.min.js":
+                  "vendor/promise.min.js",
+              "https://unpkg.com/vue@2.5.9/dist/vue.min.js":
+                  "vendor/vue.min.js",
+          }
+
+          for old, new in replacements.items():
+              html = html.replace(old, new)
+
+          html = re.sub(
+              r'\s+integrity=(["\']).*?\1',
+              '',
+              html,
+              flags=re.IGNORECASE,
+          )
+
+          html = re.sub(
+              r'\s+crossorigin=(["\']).*?\1',
+              '',
+              html,
+              flags=re.IGNORECASE,
+          )
+
+          html = re.sub(
+              r'data-realtime=(["\'])true\1',
+              'data-realtime="false"',
+              html,
+              flags=re.IGNORECASE,
+          )
+
+          path.write_text(html, encoding="utf-8")
+          PY
+
+          REQUIRED_FILES=(
+            "index.html"
+            "app/util.js"
+            "app/markers.js"
+            "app/map.js"
+            "app/gui.js"
+            "app/main.js"
+            "app/grid.js"
+            "css/style.css"
+            "dist/Leaflet.Coordinates-0.1.5.css"
+            "dist/Leaflet.Coordinates-0.1.5.min.js"
+            "data/config.json"
+            "data/villages.json"
+            "data/guardtowers.json"
+            "data/structures.json"
+            "data/portals.json"
+            "vendor/leaflet/leaflet.css"
+            "vendor/leaflet/leaflet.js"
+            "vendor/leaflet/images/marker-icon.png"
+            "vendor/leaflet/images/marker-icon-2x.png"
+            "vendor/leaflet/images/marker-shadow.png"
+            "vendor/cookies.min.js"
+            "vendor/fetch.js"
+            "vendor/promise.min.js"
+            "vendor/vue.min.js"
+            "vendor/roboto/roboto.css"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -s "$TMP/$file" ]; then
+              echo "ERROR: Missing or empty required file: $file"
+              exit 1
+            fi
+          done
+
+          TILE_COUNT="$(
+            find "$TMP/images" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.png' \
+              | wc -l
+          )"
+
+          if [ "$TILE_COUNT" -ne "$EXPECTED_TILE_COUNT" ]; then
+            echo "ERROR: Expected $EXPECTED_TILE_COUNT tiles."
+            echo "Found: $TILE_COUNT"
+            exit 1
+          fi
+
+          FONT_COUNT="$(
+            find "$TMP/vendor/roboto/fonts" \
+              -type f \
+              | wc -l
+          )"
+
+          if [ "$FONT_COUNT" -lt 1 ]; then
+            echo "ERROR: No Roboto font files were archived."
+            exit 1
+          fi
+
+          grep -q 'vendor/leaflet/leaflet.css' "$TMP/index.html"
+          grep -q 'vendor/leaflet/leaflet.js' "$TMP/index.html"
+          grep -q 'vendor/roboto/roboto.css' "$TMP/index.html"
+          grep -q 'vendor/vue.min.js' "$TMP/index.html"
+          grep -q 'vendor/cookies.min.js' "$TMP/index.html"
+          grep -q 'vendor/fetch.js' "$TMP/index.html"
+          grep -q 'vendor/promise.min.js' "$TMP/index.html"
+
+          echo
+          echo "Validation successful."
+          echo "Map tiles: $TILE_COUNT"
+          echo "Fonts: $FONT_COUNT"
+          du -sh "$TMP"
+
+          mkdir -p "$OUT"
+
+          rsync \
+            --archive \
+            --delete \
+            "$TMP/" \
+            "$OUT/"
+
+          echo
+          echo "ProjetoBR archival mirror refreshed."
+
+      - name: Check for changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          if git status --porcelain -- map | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+
+            echo "ProjetoBR map archive changed:"
+            git status --short -- map
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No ProjetoBR map changes detected."
+          fi
+
+      - name: Commit and push archive
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          git config core.autocrlf false
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A -- map
+          git commit -m "Update ProjetoBR map archive"
+          git push
