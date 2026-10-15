@@ -90,7 +90,7 @@ function boot() {
 		for (r = 0; r < ROWS; r++) {
 			L.marker(xy((c + 1) * CELL - LABEL_PAD, (r + 1) * CELL - LABEL_PAD), {
 				icon: L.divIcon({
-					className: 'balgrid-cell',
+					className: (COL_L[c] + (r + 1)) === 'F5' || (COL_L[c] + (r + 1)) === 'G5' ? 'balgrid-snow' : 'balgrid-cell',
 					html: COL_L[c] + (r + 1),
 					iconSize: [40, 13],
 					iconAnchor: [40, 13]
@@ -112,7 +112,7 @@ function boot() {
 					var ey = (r * CELL + (sy + 1) * SUB) - SUB_PAD;
 					L.marker(xy(ex, ey), {
 						icon: L.divIcon({
-							className: 'balgrid-sub',
+							className: (COL_L[c] + (r + 1)).startsWith('F5') || (COL_L[c] + (r + 1)).startsWith('G5') ? 'balgrid-snow' : 'balgrid-sub',
 							html: COL_L[c] + (r + 1) + '.' + (sy * 2 + sx + 1),
 							iconSize: [52, 13],
 							iconAnchor: [52, 13]
@@ -130,6 +130,7 @@ function boot() {
 	css.textContent = '.balgrid-cell{color:rgba(255,255,255,.7);' +
 		'font:bold 10px Roboto,sans-serif;text-align:center;line-height:13px;' +
 		'text-shadow:0 0 3px rgba(0,0,0,.9);}' +
+		'.balgrid-snow{color:rgba(0,0,0,.9);font:bold 10px Roboto,sans-serif;text-align:center;line-height:13px;text-shadow:0 0 3px rgba(255,255,255,.9);}' +
 		'.balgrid-sub{color:rgba(255,255,255,.65);' +
 		'font:bold 9px Roboto,sans-serif;text-align:center;line-height:13px;' +
 		'text-shadow:0 0 3px rgba(0,0,0,.9);}';
