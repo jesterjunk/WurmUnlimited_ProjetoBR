@@ -9,6 +9,10 @@ http://projetobr.duckdns.org:8081/
 
 map mirror https://jesterjunk.github.io/WurmUnlimited_ProjetoBR/map/
 
+area history https://jesterjunk.github.io/WurmUnlimited_ProjetoBR/area_history/
+
 https://discord.gg/ZExk9msxVk
 
 map source https://forum.wurmonline.com/index.php?/topic/190527-tanglewood-4096-medium-large-map-for-any-public-or-private-server/&tab=comments#comment-1905061
+
+https://drive.google.com/file/d/1ANwCppULz1abXWyvBnOo8hrgvJOfSCCi/view?usp=sharing
