@@ -1,0 +1,698 @@
+name: ProjetoBR
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */8 * * *" # every 8 hours (UTC)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: projetobr-archival-mirror
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install ImageMagick
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      - name: Build self-contained ProjetoBR archive
+        env:
+          SOURCE_URL: "http://projetobr.duckdns.org:8081"
+        run: |
+          set -euo pipefail
+
+          OUT="map"
+          TMP="$(mktemp -d)"
+
+          cleanup() {
+            rm -rf "$TMP"
+          }
+          trap cleanup EXIT
+
+          mkdir -p \
+            "$TMP/app" \
+            "$TMP/css" \
+            "$TMP/dist" \
+            "$TMP/data" \
+            "$TMP/source-images" \
+            "$TMP/images" \
+            "$TMP/markers" \
+            "$TMP/vendor/leaflet/images" \
+            "$TMP/vendor/roboto/fonts"
+
+          fetch_url() {
+            local url="$1"
+            local file="$2"
+
+            echo "Fetching: $url"
+            mkdir -p "$(dirname "$file")"
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --retry-all-errors \
+              --retry-delay 3 \
+              --connect-timeout 20 \
+              --max-time 180 \
+              -H 'Accept-Encoding: identity' \
+              -o "$file" \
+              "$url"
+
+            if [ ! -s "$file" ]; then
+              echo "ERROR: Empty response: $url"
+              exit 1
+            fi
+          }
+
+          fetch_site() {
+            local path="$1"
+            local file="$2"
+
+            if [ -z "$path" ]; then
+              fetch_url "$SOURCE_URL/" "$file"
+            else
+              fetch_url "$SOURCE_URL/$path" "$file"
+            fi
+          }
+
+          # Support both ImageMagick 6 and 7.
+          im_convert() {
+            if command -v magick >/dev/null 2>&1; then
+              magick "$@"
+            else
+              convert "$@"
+            fi
+          }
+
+          im_identify() {
+            if command -v magick >/dev/null 2>&1; then
+              magick identify "$@"
+            else
+              identify "$@"
+            fi
+          }
+
+          echo "=========================================="
+          echo " ProjetoBR self-contained archival mirror"
+          echo " Source: $SOURCE_URL"
+          echo " Destination: $OUT"
+          echo " Output map tiles: 1024x1024"
+          echo "=========================================="
+
+          # ------------------------------------------------------------
+          # Main ProjetoBR files
+          # ------------------------------------------------------------
+
+          fetch_site "" "$TMP/index.html"
+
+          fetch_site "app/util.js"    "$TMP/app/util.js"
+          fetch_site "app/markers.js" "$TMP/app/markers.js"
+          fetch_site "app/map.js"     "$TMP/app/map.js"
+          fetch_site "app/gui.js"     "$TMP/app/gui.js"
+          fetch_site "app/main.js"    "$TMP/app/main.js"
+          fetch_site "app/grid.js"    "$TMP/app/grid.js"
+
+          fetch_site "css/style.css" "$TMP/css/style.css"
+
+          fetch_site \
+            "dist/Leaflet.Coordinates-0.1.5.css" \
+            "$TMP/dist/Leaflet.Coordinates-0.1.5.css"
+
+          fetch_site \
+            "dist/Leaflet.Coordinates-0.1.5.min.js" \
+            "$TMP/dist/Leaflet.Coordinates-0.1.5.min.js"
+
+          # ------------------------------------------------------------
+          # Runtime data
+          # ------------------------------------------------------------
+
+          fetch_site "data/config.json"      "$TMP/data/config.json"
+          fetch_site "data/villages.json"    "$TMP/data/villages.json"
+          fetch_site "data/guardtowers.json" "$TMP/data/guardtowers.json"
+          fetch_site "data/structures.json"  "$TMP/data/structures.json"
+          fetch_site "data/portals.json"     "$TMP/data/portals.json"
+
+          # Optional realtime player snapshot.
+          if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 2 \
+              --connect-timeout 20 \
+              --max-time 60 \
+              -H 'Accept-Encoding: identity' \
+              -o "$TMP/data/players.php" \
+              "$SOURCE_URL/data/players.php"; then
+
+            if [ ! -s "$TMP/data/players.php" ]; then
+              rm -f "$TMP/data/players.php"
+            fi
+          else
+            echo "players.php unavailable; continuing."
+            rm -f "$TMP/data/players.php"
+          fi
+
+          # ------------------------------------------------------------
+          # Marker images
+          # ------------------------------------------------------------
+
+          grep -oE "markers/[A-Za-z0-9_.-]+\.png" \
+            "$TMP/app/markers.js" \
+            | sort -u \
+            > "$TMP/marker-list.txt"
+
+          while IFS= read -r marker; do
+            [ -n "$marker" ] || continue
+            fetch_site "$marker" "$TMP/$marker"
+          done < "$TMP/marker-list.txt"
+
+          rm -f "$TMP/marker-list.txt"
+
+          # ------------------------------------------------------------
+          # Download original 256x256 source map tiles.
+          #
+          # ProjetoBR is a 4096x4096 map:
+          #   4096 / 256 = 16 source tiles per axis
+          #   16 x 16 = 256 source tile requests during the Actions job
+          #
+          # These source tiles are NOT published to GitHub Pages.
+          # ------------------------------------------------------------
+
+          SOURCE_TILE_SIZE=256
+          SOURCE_TILES_PER_AXIS=16
+          SOURCE_TILE_COUNT=256
+
+          echo
+          echo "Downloading $SOURCE_TILE_COUNT original 256x256 tiles..."
+
+          for x in $(seq 0 15); do
+            for y in $(seq 0 15); do
+              fetch_site \
+                "images/${x}-${y}.png" \
+                "$TMP/source-images/${x}-${y}.png"
+            done
+          done
+
+          ACTUAL_SOURCE_COUNT="$(
+            find "$TMP/source-images" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.png' \
+              | wc -l
+          )"
+
+          if [ "$ACTUAL_SOURCE_COUNT" -ne "$SOURCE_TILE_COUNT" ]; then
+            echo "ERROR: Expected $SOURCE_TILE_COUNT source tiles."
+            echo "Found: $ACTUAL_SOURCE_COUNT"
+            exit 1
+          fi
+
+          # ------------------------------------------------------------
+          # Merge the 256 source tiles without using ImageMagick @file.
+          #
+          # Ubuntu's ImageMagick 6 security policy commonly blocks
+          # indirect filename reads such as:
+          #
+          #     montage @tile-list.txt
+          #
+          # Build each 4096x256 row explicitly with +append, then join
+          # the 16 rows vertically with -append. This preserves the
+          # original X-Y tile orientation and avoids the policy issue.
+          # ------------------------------------------------------------
+
+          mkdir -p "$TMP/rows"
+
+          echo
+          echo "Building 16 horizontal map rows..."
+
+          for y in $(seq 0 15); do
+            im_convert \
+              "$TMP/source-images/0-${y}.png" \
+              "$TMP/source-images/1-${y}.png" \
+              "$TMP/source-images/2-${y}.png" \
+              "$TMP/source-images/3-${y}.png" \
+              "$TMP/source-images/4-${y}.png" \
+              "$TMP/source-images/5-${y}.png" \
+              "$TMP/source-images/6-${y}.png" \
+              "$TMP/source-images/7-${y}.png" \
+              "$TMP/source-images/8-${y}.png" \
+              "$TMP/source-images/9-${y}.png" \
+              "$TMP/source-images/10-${y}.png" \
+              "$TMP/source-images/11-${y}.png" \
+              "$TMP/source-images/12-${y}.png" \
+              "$TMP/source-images/13-${y}.png" \
+              "$TMP/source-images/14-${y}.png" \
+              "$TMP/source-images/15-${y}.png" \
+              +append \
+              "$TMP/rows/row-${y}.png"
+
+            ROW_SIZE="$(im_identify -format '%wx%h' "$TMP/rows/row-${y}.png")"
+
+            if [ "$ROW_SIZE" != "4096x256" ]; then
+              echo "ERROR: Row $y is $ROW_SIZE; expected 4096x256."
+              exit 1
+            fi
+          done
+
+          FULL_MAP="$TMP/projetobr-full-4096.png"
+
+          echo
+          echo "Joining rows into one 4096x4096 image..."
+
+          im_convert \
+            "$TMP/rows/row-0.png" \
+            "$TMP/rows/row-1.png" \
+            "$TMP/rows/row-2.png" \
+            "$TMP/rows/row-3.png" \
+            "$TMP/rows/row-4.png" \
+            "$TMP/rows/row-5.png" \
+            "$TMP/rows/row-6.png" \
+            "$TMP/rows/row-7.png" \
+            "$TMP/rows/row-8.png" \
+            "$TMP/rows/row-9.png" \
+            "$TMP/rows/row-10.png" \
+            "$TMP/rows/row-11.png" \
+            "$TMP/rows/row-12.png" \
+            "$TMP/rows/row-13.png" \
+            "$TMP/rows/row-14.png" \
+            "$TMP/rows/row-15.png" \
+            -append \
+            "$FULL_MAP"
+
+          FULL_SIZE="$(im_identify -format '%wx%h' "$FULL_MAP")"
+
+          echo "Merged map dimensions: $FULL_SIZE"
+
+          if [ "$FULL_SIZE" != "4096x4096" ]; then
+            echo "ERROR: Expected merged image to be 4096x4096."
+            exit 1
+          fi
+
+          # ------------------------------------------------------------
+          # Split the merged map into 1024x1024 Leaflet tiles.
+          #
+          # 4096 / 1024 = 4 per axis
+          # 4 x 4 = 16 browser map tile requests maximum at native zoom.
+          # ------------------------------------------------------------
+
+          OUTPUT_TILE_SIZE=1024
+          OUTPUT_TILES_PER_AXIS=4
+          OUTPUT_TILE_COUNT=16
+
+          echo
+          echo "Splitting merged image into $OUTPUT_TILE_COUNT 1024x1024 tiles..."
+
+          for y in $(seq 0 3); do
+            for x in $(seq 0 3); do
+              X_OFFSET="$((x * OUTPUT_TILE_SIZE))"
+              Y_OFFSET="$((y * OUTPUT_TILE_SIZE))"
+
+              im_convert \
+                "$FULL_MAP" \
+                -crop "${OUTPUT_TILE_SIZE}x${OUTPUT_TILE_SIZE}+${X_OFFSET}+${Y_OFFSET}" \
+                +repage \
+                "$TMP/images/${x}-${y}.png"
+            done
+          done
+
+          ACTUAL_OUTPUT_COUNT="$(
+            find "$TMP/images" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.png' \
+              | wc -l
+          )"
+
+          if [ "$ACTUAL_OUTPUT_COUNT" -ne "$OUTPUT_TILE_COUNT" ]; then
+            echo "ERROR: Expected $OUTPUT_TILE_COUNT output tiles."
+            echo "Found: $ACTUAL_OUTPUT_COUNT"
+            exit 1
+          fi
+
+          for tile in "$TMP"/images/*.png; do
+            SIZE="$(im_identify -format '%wx%h' "$tile")"
+            if [ "$SIZE" != "1024x1024" ]; then
+              echo "ERROR: Invalid output tile dimensions:"
+              echo "  $tile = $SIZE"
+              exit 1
+            fi
+          done
+
+          # ------------------------------------------------------------
+          # IMPORTANT:
+          #
+          # Leave data/config.json unchanged.
+          #
+          # WurmMapGen main.js uses config.mapTileSize when calculating
+          # xyMulitiplier for game-coordinate -> Leaflet-coordinate
+          # conversion. Changing config.mapTileSize would move deeds,
+          # towers, structures and the custom balance grid.
+          #
+          # Only change the Leaflet TileLayer's physical tileSize.
+          # ------------------------------------------------------------
+
+          python3 - "$TMP/app/map.js" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+
+          old = "tileSize: config.mapTileSize,"
+          new = "tileSize: 1024,"
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: Could not find expected tileSize setting in app/map.js"
+              )
+
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+
+          print("Patched app/map.js: Leaflet tileSize = 1024")
+          PY
+
+          grep -q 'tileSize: 1024,' "$TMP/app/map.js"
+
+          # ------------------------------------------------------------
+          # Vendor Leaflet and its images
+          # ------------------------------------------------------------
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/leaflet.css" \
+            "$TMP/vendor/leaflet/leaflet.css"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/leaflet.js" \
+            "$TMP/vendor/leaflet/leaflet.js"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/images/marker-icon.png" \
+            "$TMP/vendor/leaflet/images/marker-icon.png"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/images/marker-icon-2x.png" \
+            "$TMP/vendor/leaflet/images/marker-icon-2x.png"
+
+          fetch_url \
+            "https://unpkg.com/leaflet@1.2.0/dist/images/marker-shadow.png" \
+            "$TMP/vendor/leaflet/images/marker-shadow.png"
+
+          # ------------------------------------------------------------
+          # Vendor JS dependencies
+          # ------------------------------------------------------------
+
+          fetch_url \
+            "https://unpkg.com/cookies-js@1.2.3/dist/cookies.min.js" \
+            "$TMP/vendor/cookies.min.js"
+
+          fetch_url \
+            "https://unpkg.com/whatwg-fetch@2.0.3/fetch.js" \
+            "$TMP/vendor/fetch.js"
+
+          fetch_url \
+            "https://unpkg.com/promise-polyfill@6.1.0/promise.min.js" \
+            "$TMP/vendor/promise.min.js"
+
+          fetch_url \
+            "https://unpkg.com/vue@2.5.9/dist/vue.min.js" \
+            "$TMP/vendor/vue.min.js"
+
+          # ------------------------------------------------------------
+          # Vendor Roboto font
+          # ------------------------------------------------------------
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 20 \
+            --max-time 180 \
+            -A "Mozilla/5.0" \
+            -o "$TMP/vendor/roboto/roboto.css.remote" \
+            "https://fonts.googleapis.com/css?family=Roboto:400,700"
+
+          python3 - "$TMP/vendor/roboto/roboto.css.remote" <<'PY'
+          import hashlib
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          source = Path(sys.argv[1])
+          base = source.parent
+          font_dir = base / "fonts"
+          font_dir.mkdir(parents=True, exist_ok=True)
+
+          css = source.read_text(encoding="utf-8")
+          urls = []
+
+          for match in re.finditer(
+              r"url\((['\"]?)(https?://[^)'\"\s]+)\1\)",
+              css
+          ):
+              url = match.group(2)
+              if url not in urls:
+                  urls.append(url)
+
+          for url in urls:
+              parsed = urlparse(url)
+              original_name = os.path.basename(parsed.path) or "font"
+              digest = hashlib.sha256(url.encode()).hexdigest()[:10]
+              filename = f"{digest}-{original_name}"
+              destination = font_dir / filename
+
+              print(f"Fetching font: {url}")
+
+              subprocess.run(
+                  [
+                      "curl",
+                      "--fail",
+                      "--silent",
+                      "--show-error",
+                      "--location",
+                      "--retry", "3",
+                      "--retry-all-errors",
+                      "--connect-timeout", "20",
+                      "--max-time", "180",
+                      "-H", "Accept-Encoding: identity",
+                      "-o", str(destination),
+                      url,
+                  ],
+                  check=True,
+              )
+
+              if not destination.exists() or destination.stat().st_size == 0:
+                  raise SystemExit(f"Downloaded font is empty: {url}")
+
+              css = css.replace(url, f"fonts/{filename}")
+
+          (base / "roboto.css").write_text(css, encoding="utf-8")
+          source.unlink()
+          PY
+
+          # ------------------------------------------------------------
+          # Rewrite index.html to local vendor resources
+          # ------------------------------------------------------------
+
+          python3 - "$TMP/index.html" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          html = path.read_text(encoding="utf-8")
+
+          replacements = {
+              "https://unpkg.com/leaflet@1.2.0/dist/leaflet.css":
+                  "vendor/leaflet/leaflet.css",
+              "https://fonts.googleapis.com/css?family=Roboto:400,700":
+                  "vendor/roboto/roboto.css",
+              "https://unpkg.com/leaflet@1.2.0/dist/leaflet.js":
+                  "vendor/leaflet/leaflet.js",
+              "https://unpkg.com/cookies-js@1.2.3/dist/cookies.min.js":
+                  "vendor/cookies.min.js",
+              "https://unpkg.com/whatwg-fetch@2.0.3/fetch.js":
+                  "vendor/fetch.js",
+              "https://unpkg.com/promise-polyfill@6.1.0/promise.min.js":
+                  "vendor/promise.min.js",
+              "https://unpkg.com/vue@2.5.9/dist/vue.min.js":
+                  "vendor/vue.min.js",
+          }
+
+          for old, new in replacements.items():
+              html = html.replace(old, new)
+
+          html = re.sub(
+              r'\s+integrity=(["\']).*?\1',
+              '',
+              html,
+              flags=re.IGNORECASE,
+          )
+
+          html = re.sub(
+              r'\s+crossorigin=(["\']).*?\1',
+              '',
+              html,
+              flags=re.IGNORECASE,
+          )
+
+          html = re.sub(
+              r'data-realtime=(["\'])true\1',
+              'data-realtime="false"',
+              html,
+              flags=re.IGNORECASE,
+          )
+
+          path.write_text(html, encoding="utf-8")
+          PY
+
+          # ------------------------------------------------------------
+          # Validate archive
+          # ------------------------------------------------------------
+
+          REQUIRED_FILES=(
+            "index.html"
+            "app/util.js"
+            "app/markers.js"
+            "app/map.js"
+            "app/gui.js"
+            "app/main.js"
+            "app/grid.js"
+            "css/style.css"
+            "dist/Leaflet.Coordinates-0.1.5.css"
+            "dist/Leaflet.Coordinates-0.1.5.min.js"
+            "data/config.json"
+            "data/villages.json"
+            "data/guardtowers.json"
+            "data/structures.json"
+            "data/portals.json"
+            "images/0-0.png"
+            "images/3-3.png"
+            "vendor/leaflet/leaflet.css"
+            "vendor/leaflet/leaflet.js"
+            "vendor/leaflet/images/marker-icon.png"
+            "vendor/leaflet/images/marker-icon-2x.png"
+            "vendor/leaflet/images/marker-shadow.png"
+            "vendor/cookies.min.js"
+            "vendor/fetch.js"
+            "vendor/promise.min.js"
+            "vendor/vue.min.js"
+            "vendor/roboto/roboto.css"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -s "$TMP/$file" ]; then
+              echo "ERROR: Missing or empty required file: $file"
+              exit 1
+            fi
+          done
+
+          FINAL_TILE_COUNT="$(
+            find "$TMP/images" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.png' \
+              | wc -l
+          )"
+
+          if [ "$FINAL_TILE_COUNT" -ne 16 ]; then
+            echo "ERROR: Expected exactly 16 published map tiles."
+            echo "Found: $FINAL_TILE_COUNT"
+            exit 1
+          fi
+
+          FONT_COUNT="$(
+            find "$TMP/vendor/roboto/fonts" \
+              -type f \
+              | wc -l
+          )"
+
+          if [ "$FONT_COUNT" -lt 1 ]; then
+            echo "ERROR: No Roboto font files were archived."
+            exit 1
+          fi
+
+          grep -q 'tileSize: 1024,' "$TMP/app/map.js"
+          grep -q 'vendor/leaflet/leaflet.css' "$TMP/index.html"
+          grep -q 'vendor/leaflet/leaflet.js' "$TMP/index.html"
+          grep -q 'vendor/roboto/roboto.css' "$TMP/index.html"
+          grep -q 'vendor/vue.min.js' "$TMP/index.html"
+          grep -q 'vendor/cookies.min.js' "$TMP/index.html"
+          grep -q 'vendor/fetch.js' "$TMP/index.html"
+          grep -q 'vendor/promise.min.js' "$TMP/index.html"
+
+          echo
+          echo "Validation successful."
+          echo "Published map tiles: $FINAL_TILE_COUNT"
+          echo "Published tile size: 1024x1024"
+          echo "Fonts: $FONT_COUNT"
+          du -sh "$TMP"
+
+          # Remove intermediate source material before publishing.
+          rm -rf "$TMP/source-images"
+          rm -rf "$TMP/rows"
+          rm -f "$TMP/projetobr-full-4096.png"
+
+          # ------------------------------------------------------------
+          # Replace repository snapshot only after validation succeeds
+          # ------------------------------------------------------------
+
+          mkdir -p "$OUT"
+
+          rsync \
+            --archive \
+            --delete \
+            "$TMP/" \
+            "$OUT/"
+
+          echo
+          echo "ProjetoBR archival mirror refreshed."
+
+      - name: Check for changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          if git status --porcelain -- map | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+
+            echo "ProjetoBR map archive changed:"
+            git status --short -- map
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No ProjetoBR map changes detected."
+          fi
+
+      - name: Commit and push archive
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          git config core.autocrlf false
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A -- map
+          git commit -m "Update ProjetoBR map archive"
+          git push
