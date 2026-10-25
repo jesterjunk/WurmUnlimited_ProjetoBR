@@ -35,7 +35,7 @@ WurmMapGen.map = {
         map.setZoom(Math.ceil((config.mapMinZoom + config.mapMaxZoom) / 2) - 1);
 
 		var wurmMapLayer = L.tileLayer('images/{x}-{y}.png', {
-			tileSize: config.mapTileSize,
+			tileSize: 1024,
 			maxNativeZoom: config.nativeZoom,
 			minNativeZoom: config.nativeZoom,
 			minZoom: config.mapMinZoom,
